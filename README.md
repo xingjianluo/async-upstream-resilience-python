@@ -10,6 +10,7 @@ HTTP /query ──> ResilienceService.query(key, caller)
                    ├─ 1. PriorityGate     配额 + 全局容量 + 优先级排队
                    ├─ 2. TTLCache         单飞合并、fresh/stale 取舍
                    └─ 3. SourceAggregator 多来源并行抓取（信号量 + 超时）
+                          └─ SourceFallbackStore 按来源短期回退
 ```
 
 模块职责：
@@ -18,7 +19,8 @@ HTTP /query ──> ResilienceService.query(key, caller)
 | --- | --- |
 | `app/models.py` | 枚举与数据结构：来源状态、缓存状态、拒绝原因、对外响应 |
 | `app/config.py` | 全部关键配置项（见第 4 节） |
-| `app/aggregator.py` | 多来源并行、单来源超时、整体预算、部分失败降级 |
+| `app/aggregator.py` | 多来源并行、单来源超时、整体预算、部分失败降级、回退装配 |
+| `app/fallback.py` | 按 (key, source) 记录最近成功值，提供有效期内回退 |
 | `app/cache.py` | 单飞回源合并、TTL、stale-while-revalidate、失败取舍 |
 | `app/quota.py` | 调用方并发配额、全局容量、HIGH/LOW 优先级队列 |
 | `app/service.py` | 串联三层的门面，统一取消清理 |
@@ -35,11 +37,32 @@ HTTP /query ──> ResilienceService.query(key, caller)
 - 整次查询受 `aggregate_timeout` 预算约束：预算耗尽时已完成的结果保留，
   未完成来源标注 `cancelled`，查询不因此失败；
 - 来源抛异常标注 `error`。三种缺失都出现在响应的 `source_states` 中，
-  且 `degraded=true`；合并结果只包含 `ok` 来源的数据。
-- 全部来源都不可用时 `AggregatedResult.any_ok=false`，交由缓存层决定
-  “返回旧值”还是“明确拒绝”。
+  且 `degraded=true`；合并结果只包含 `ok` 来源与回退来源的数据。
+- 全部来源都不可用（含无法回退）时 `AggregatedResult.any_usable=false`，
+  交由缓存层决定“返回旧值”还是“明确拒绝”。
 
-### 2.2 缓存新旧值取舍（TTLCache，时间基于 monotonic）
+### 2.2 按来源短期回退（SourceFallbackStore）
+
+适用场景：某个来源只是**短暂抖动**（偶发超时/报错）时，不希望这一次查询
+就把该来源的数据整块丢掉。聚合层为每个 `(key, source)` 记录最近一次
+**真实成功**的值，来源本次失败时在有效期 `fallback_ttl` 内用它临时顶上。
+
+规则：
+
+- **只有真实成功的值才刷新基准**——失败与回退值本身都不会写入，因此一次
+  部分成功不会冲掉其他来源此前可用的基准，后续查询仍可使用它们；
+- 回退值**显式标注、绝不冒充实时值**：`source_states` 保留真实失败原因
+  （`timeout`/`error`/`cancelled`），响应新增 `fallback_sources` 字段列出
+  回退来源及其大致年龄（秒），`detail` 中同样注明；
+- **有效期可配置**：基准年龄超过 `fallback_ttl` 即不再兜底，回到既有的
+  缺失/拒绝行为；`fallback_ttl <= 0` 整体关闭回退；
+- 组合结果：部分实时 + 部分回退 → 查询成功且 `degraded=true`；全部来源
+  失败但都在回退有效期内 → 查询成功且 `degraded=true`；全部失败且无可
+  回退 → 维持 HTTP 502 明确拒绝；
+- 回退装配发生在聚合层（配额门与缓存单飞之内），**不绕过任何容量限制**，
+  同键并发仍只有一次真实回源，回退只影响这一次回源内部的取值。
+
+### 2.3 缓存新旧值取舍（TTLCache，时间基于 monotonic）
 
 设条目年龄 `age = now - stored_at`：
 
@@ -91,6 +114,7 @@ HTTP /query ──> ResilienceService.query(key, caller)
 | `stale_ttl` | 5.0s | 旧值可接受宽限期 |
 | `allow_stale_on_error` | True | 回源失败时是否允许返回宽限内旧值 |
 | `refresh_min_interval` | 0.05s | 每键刷新节流，防 stale 期回源风暴 |
+| `fallback_ttl` | 2.0s | 按来源回退有效期；≤0 关闭回退 |
 | `QuotaPolicy.quotas` | 未登记=4 | 每调用方并发上限 |
 | `QuotaPolicy.priorities` | 未登记=LOW | 每调用方优先级 |
 
@@ -104,8 +128,15 @@ HTTP /query ──> ResilienceService.query(key, caller)
 - 回源：`fetch_started`、`fetch_shared`、`fetch_failures`、
   `fetch_by_key`（断言“同键仅一次回源”）
 - 来源：`source_ok` / `source_timeout` / `source_error` / `source_cancelled`
+  （记录**真实失败原因**，回退不覆盖失败计数）
+- 回退：`fallback_hits`、`fallback_hits_by_source`——与来源失败、
+  `fetch_failures`（最终拒绝）三者分开计数，可互相对账
 - 配额门：`admitted`、`released`、`rejected_quota`、`rejected_capacity`
   及按调用方细分的拒绝计数
+
+响应兼容说明：`/query` 响应新增 `fallback_sources` 字段（对象，来源名 →
+回退值大致年龄秒数），其余字段语义不变；无回退时为空对象。`/metrics`
+新增上述回退计数键，旧键不变。
 
 单测与运行日志对每个判定打印**输入**（key/caller/来源/延迟）与**判定依据**
 （状态、年龄、缺失来源、拒绝原因）。
@@ -116,8 +147,9 @@ HTTP /query ──> ResilienceService.query(key, caller)
 
 ```bash
 uv sync                                  # 安装含 pytest 的依赖
-uv run pytest -q                         # 全部单测（23 个，告警即失败）
+uv run pytest -q                         # 全部单测（34 个，告警即失败）
 uv run pytest tests/test_cache.py -s -q  # 只跑缓存并发用例
+uv run pytest tests/test_fallback.py -s -q  # 只跑按来源回退用例
 ```
 
 启动演示服务（3 个模拟来源，flaky 可由环境变量制造故障）：
@@ -129,11 +161,18 @@ curl 'http://127.0.0.1:8000/metrics'
 FLAKY=timeout uv run uvicorn main:app --port 8000   # 演示来源超时降级
 ```
 
+本地复现回退：先正常查询一次建立基准，再让某来源抖动（如
+`FLAKY=error`），在 `fallback_ttl` 内重复查询，响应中
+`source_states.flaky` 为真实失败状态、`fallback_sources.flaky` 给出回退值
+年龄，`/metrics` 的 `fallback_hits` 同步 +1；等待超过 `fallback_ttl`
+后回退消失，回到缺失标注或 502 拒绝。
+
 ### 测试覆盖场景
 
 | 文件 | 覆盖 |
 | --- | --- |
 | `tests/test_aggregator.py` | 部分失败、单来源超时、整体预算取消并清理、全失败 |
+| `tests/test_fallback.py` | 来源抖动后按来源回退、回退有效期边界、部分成功不冲基准、全失败回退/拒绝、同键并发不放大、取消隔离、配额与容量拒绝可区分 |
 | `tests/test_cache.py` | 10 并发单飞、fresh 命中、SWR 刷新、失败返旧值、过期拒绝、领导取消不杀回源 |
 | `tests/test_quota.py` | 配额 vs 容量拒绝可区分、HIGH 插队、等待取消无残留 |
 | `tests/test_service_integration.py` | 20 并发同键单回源、配额拒绝不泄漏、调用方取消清理、高优先级不被饿死 |

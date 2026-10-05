@@ -47,13 +47,20 @@ class RejectReason(Enum):
 
 @dataclass
 class SourceResult:
-    """单个来源的结果或失败标注。失败时 value=None。"""
+    """单个来源的结果或失败标注。失败时 value=None。
+
+    回退语义：本次实时取数失败（state 非 OK）但命中按来源短期回退时，
+    fallback=True、value 为最近一次成功值、fallback_age 为其大致年龄；
+    state 保留真实失败原因，绝不把回退值伪装成本次实时值。
+    """
 
     source: str
     state: SourceState
     value: object | None = None
     error: str | None = None
     elapsed: float = 0.0
+    fallback: bool = False
+    fallback_age: float | None = None
 
 
 @dataclass
@@ -70,6 +77,13 @@ class AggregatedResult:
     @property
     def any_ok(self) -> bool:
         return any(s.state is SourceState.OK for s in self.sources.values())
+
+    @property
+    def any_usable(self) -> bool:
+        """是否存在可用数据：实时 OK 或命中回退的来源都算。"""
+        return any(
+            s.state is SourceState.OK or s.fallback for s in self.sources.values()
+        )
 
 
 @dataclass
@@ -91,7 +105,11 @@ class CacheEntry:
 
 @dataclass
 class QueryResponse:
-    """对外查询响应：数据 + 完整可解释性标注。"""
+    """对外查询响应：数据 + 完整可解释性标注。
+
+    fallback_sources: 本次以回退值顶上的来源及其大致年龄（秒）；
+    与 source_states 对照即可区分实时值与回退值。
+    """
 
     key: str
     data: object | None
@@ -101,6 +119,7 @@ class QueryResponse:
     in_flight_shared: bool
     age: float
     detail: str
+    fallback_sources: dict[str, float] = field(default_factory=dict)
 
 
 class ResilienceError(Exception):

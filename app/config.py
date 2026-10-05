@@ -42,6 +42,8 @@ class ResilienceConfig:
     - stale_ttl: 新鲜期之后旧值仍可接受的宽限期；超宽限期旧值不再返回。
     - allow_stale_on_error: 回源失败时是否允许返回宽限期内旧值。
     - refresh_min_interval: 每键回源节流间隔，防止 stale 期并发风暴。
+    - fallback_ttl: 按来源短期回退的有效期：来源本次失败时，最近一次
+      成功值在此期限内可临时顶上（显式标注为回退值）；<=0 关闭回退。
     """
 
     default_source_timeout: float = 0.5
@@ -52,3 +54,4 @@ class ResilienceConfig:
     stale_ttl: float = 5.0
     allow_stale_on_error: bool = True
     refresh_min_interval: float = 0.05
+    fallback_ttl: float = 2.0

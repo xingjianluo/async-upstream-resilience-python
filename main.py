@@ -49,6 +49,8 @@ def build_service() -> ResilienceService:
         fresh_ttl=1.0,
         stale_ttl=5.0,
         refresh_min_interval=0.1,
+        # 按来源回退有效期：FLAKY 抖动时 2s 内用最近成功值顶上并显式标注
+        fallback_ttl=float(os.environ.get("FALLBACK_TTL", "2.0")),
     )
     policy = QuotaPolicy(
         quotas={"alpha": 4, "beta": 2, "gamma": 2},

@@ -68,6 +68,7 @@ def create_app(service: ResilienceService) -> FastAPI:
             "cache_state": resp.cache_state.value,
             "degraded": resp.degraded,
             "source_states": {k: s.value for k, s in resp.source_states.items()},
+            "fallback_sources": resp.fallback_sources,
             "in_flight_shared": resp.in_flight_shared,
             "age": round(resp.age, 6),
             "detail": resp.detail,

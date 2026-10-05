@@ -7,7 +7,11 @@
 - 整次聚合受 aggregate_timeout 预算约束：预算耗尽时已完成来源保留，
   未完成来源标注 CANCELLED；
 - 来源抛错标注 ERROR。TIMEOUT/ERROR/CANCELLED 均为“降级缺失”而非整次失败；
-- 全部来源都不可用时，返回结果 any_ok=False，由上层决定返回旧值或明确拒绝。
+- 按来源短期回退：来源本次失败时，若该来源在 fallback_ttl 内有最近成功值，
+  则临时顶上（fallback=True、保留真实失败 state、标注大致年龄），
+  只有真实成功的值才刷新基准，部分成功不会冲掉其他来源的基准；
+- 全部来源都不可用（含无法回退）时，返回结果 any_usable=False，
+  由上层决定返回旧值或明确拒绝。
 """
 from __future__ import annotations
 
@@ -17,6 +21,7 @@ import time
 from collections.abc import Awaitable, Callable
 
 from app.config import ResilienceConfig
+from app.fallback import SourceFallbackStore
 from app.metrics import Metrics
 from app.models import AggregatedResult, SourceResult, SourceState
 
@@ -39,6 +44,7 @@ class SourceAggregator:
         self._source_timeouts = dict(source_timeouts or {})
         self._sem = asyncio.Semaphore(config.fetch_concurrency)
         self._metrics = metrics
+        self._fallback = SourceFallbackStore(config.fallback_ttl)
 
     def _timeout_of(self, name: str) -> float:
         return self._source_timeouts.get(name, self._config.default_source_timeout)
@@ -108,8 +114,12 @@ class SourceAggregator:
             if self._metrics is not None:
                 self._metrics.record_source(result.state.value)
 
+        self._apply_fallback(key, results)
+
         merged = {
-            name: r.value for name, r in results.items() if r.state is SourceState.OK
+            name: r.value
+            for name, r in results.items()
+            if r.state is SourceState.OK or r.fallback
         }
         degraded = any(r.state is not SourceState.OK for r in results.values())
         total = time.monotonic() - start
@@ -128,6 +138,29 @@ class SourceAggregator:
             degraded=degraded,
             total_elapsed=total,
         )
+
+    def _apply_fallback(self, key: str, results: dict[str, SourceResult]) -> None:
+        """按来源回退收尾：成功值刷新基准；失败来源尝试用近期基准顶上。
+
+        回退只改 SourceResult 的 value/fallback 标注，不改 state——
+        真实失败原因保留，指标上失败与回退命中分开计数。
+        """
+        for name, result in results.items():
+            if result.state is SourceState.OK:
+                self._fallback.record_success(key, name, result.value)
+                continue
+            record = self._fallback.lookup(key, name)
+            if record is None:
+                continue
+            result.value = record.value
+            result.fallback = True
+            result.fallback_age = record.age(time.monotonic())
+            if self._metrics is not None:
+                self._metrics.record_fallback_hit(name)
+            logger.info(
+                "source served from fallback: key=%s source=%s state=%s age=%.3fs",
+                key, name, result.state.value, result.fallback_age,
+            )
 
     def _resolve_task(
         self, name: str, key: str, task: asyncio.Task[SourceResult]

@@ -16,11 +16,14 @@ class Metrics:
         self.fetch_failures = 0  # 回源后无任何来源 OK
         # 每键真实回源次数，用于断言“同键只回源一次”
         self.fetch_by_key: dict[str, int] = {}
-        # 按来源统计结果状态
+        # 按来源统计结果状态（记录真实失败原因，回退不覆盖失败计数）
         self.source_ok = 0
         self.source_timeout = 0
         self.source_error = 0
         self.source_cancelled = 0
+        # 回退命中：来源本次失败但用近期成功值顶上（与来源失败分开计数）
+        self.fallback_hits = 0
+        self.fallback_hits_by_source: dict[str, int] = {}
         # 配额门
         self.rejected_quota = 0
         self.rejected_capacity = 0
@@ -59,6 +62,13 @@ class Metrics:
             attr = f"source_{state}"
             setattr(self, attr, getattr(self, attr) + 1)
 
+    def record_fallback_hit(self, source: str) -> None:
+        with self._lock:
+            self.fallback_hits += 1
+            self.fallback_hits_by_source[source] = (
+                self.fallback_hits_by_source.get(source, 0) + 1
+            )
+
     def record_reject_quota(self, caller: str) -> None:
         with self._lock:
             self.rejected_quota += 1
@@ -96,6 +106,8 @@ class Metrics:
                 "source_timeout": self.source_timeout,
                 "source_error": self.source_error,
                 "source_cancelled": self.source_cancelled,
+                "fallback_hits": self.fallback_hits,
+                "fallback_hits_by_source": dict(self.fallback_hits_by_source),
                 "rejected_quota": self.rejected_quota,
                 "rejected_capacity": self.rejected_capacity,
                 "admitted": self.admitted,

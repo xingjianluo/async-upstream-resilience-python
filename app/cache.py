@@ -14,7 +14,9 @@
 - 无缓存（MISS）                  -> 同键仅一个真实回源，其余并发共享并等待。
 
 取消语义：领导/等待请求被取消不会取消真实回源任务——回源在独立任务中继续，
-完成后照常写缓存；在途表在 settle 时清理，计数自洽、不串号。
+完成后照常写缓存；等待共享 future 时经 asyncio.shield 隔离，任一等待者
+取消不会传播到共享 future、不影响其他等待者；在途表在 settle 时清理，
+计数自洽、不串号。
 """
 from __future__ import annotations
 
@@ -164,7 +166,9 @@ class TTLCache:
         *,
         shared: bool,
     ) -> QueryResponse:
-        response = await future  # 失败时抛 UpstreamUnavailableError，语义即拒绝
+        # shield：任一等待者被取消时，取消不传播到共享 future，
+        # 其余等待者仍能拿到回源结果（回源任务本身也是独立任务）。
+        response = await asyncio.shield(future)  # 失败时抛 UpstreamUnavailableError，语义即拒绝
         if not shared:
             # 领导请求：future 完成的就是它触发的回源结果，保留底层真实状态。
             logger.info(
@@ -188,6 +192,7 @@ class TTLCache:
             in_flight_shared=True,
             age=response.age,
             detail=detail,
+            fallback_sources=dict(response.fallback_sources),
         )
 
     async def _run_fetch(
@@ -205,7 +210,7 @@ class TTLCache:
             await self._settle_failure(key, had_stale, repr(exc))
             return
 
-        if result.any_ok:
+        if result.any_usable:
             await self._settle_success(key, result, had_stale)
         else:
             await self._settle_failure(
@@ -289,6 +294,11 @@ class TTLCache:
         result = entry.result
         age = time.monotonic() - entry.stored_at
         source_states = {n: r.state for n, r in result.sources.items()}
+        fallback_sources = {
+            n: round(r.fallback_age or 0.0, 6)
+            for n, r in result.sources.items()
+            if r.fallback
+        }
         detail = override_detail or self._explain(state, result, age)
         return QueryResponse(
             key=result.key,
@@ -299,6 +309,7 @@ class TTLCache:
             in_flight_shared=in_flight_shared,
             age=age,
             detail=detail,
+            fallback_sources=fallback_sources,
         )
 
     @staticmethod
@@ -308,12 +319,22 @@ class TTLCache:
             for n, r in result.sources.items()
             if r.state is not None
             and r.state.value != "ok"
+            and not r.fallback
+        ]
+        fallbacks = [
+            f"{n}:age={r.fallback_age:.3f}s"
+            for n, r in result.sources.items()
+            if r.fallback and r.fallback_age is not None
         ]
         missing_part = f" missing=[{', '.join(missing)}]" if missing else ""
+        fallback_part = (
+            f" fallback=[{', '.join(fallbacks)}]" if fallbacks else ""
+        )
+        suffix = missing_part + fallback_part
         if state is CacheState.FRESH:
-            return f"fresh cache hit, age={age:.3f}s.{missing_part}"
+            return f"fresh cache hit, age={age:.3f}s.{suffix}"
         if state is CacheState.STALE:
-            return f"serving stale value, age={age:.3f}s.{missing_part}"
+            return f"serving stale value, age={age:.3f}s.{suffix}"
         if state is CacheState.STALE_FRESH:
-            return f"stale entry triggered refresh; new value stored, age={age:.3f}s.{missing_part}"
-        return f"cache miss, fetched from upstream, age={age:.3f}s.{missing_part}"
+            return f"stale entry triggered refresh; new value stored, age={age:.3f}s.{suffix}"
+        return f"cache miss, fetched from upstream, age={age:.3f}s.{suffix}"
