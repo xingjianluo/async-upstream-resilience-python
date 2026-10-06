@@ -30,6 +30,7 @@ from app.models import (
     AggregatedResult,
     CacheState,
     QueryResponse,
+    SourceState,
     UpstreamUnavailableError,
 )
 
@@ -164,7 +165,9 @@ class TTLCache:
         *,
         shared: bool,
     ) -> QueryResponse:
-        response = await future  # 失败时抛 UpstreamUnavailableError，语义即拒绝
+        # shield：任一等待者被取消只取消它自己的等待，不取消共享 future，
+        # 其余等待者仍能拿到回源结果（取消隔离）。
+        response = await asyncio.shield(future)  # 失败时抛 UpstreamUnavailableError，语义即拒绝
         if not shared:
             # 领导请求：future 完成的就是它触发的回源结果，保留底层真实状态。
             logger.info(
@@ -188,6 +191,7 @@ class TTLCache:
             in_flight_shared=True,
             age=response.age,
             detail=detail,
+            fallback_ages=dict(response.fallback_ages),
         )
 
     async def _run_fetch(
@@ -205,13 +209,13 @@ class TTLCache:
             await self._settle_failure(key, had_stale, repr(exc))
             return
 
-        if result.any_ok:
+        if result.any_usable:
             await self._settle_success(key, result, had_stale)
         else:
             await self._settle_failure(
                 key,
                 had_stale,
-                "all sources unavailable: "
+                "all sources unavailable (no live value, no fallback): "
                 + ",".join(f"{n}:{r.state.value}" for n, r in result.sources.items()),
             )
 
@@ -289,6 +293,11 @@ class TTLCache:
         result = entry.result
         age = time.monotonic() - entry.stored_at
         source_states = {n: r.state for n, r in result.sources.items()}
+        fallback_ages = {
+            n: r.fallback_age
+            for n, r in result.sources.items()
+            if r.state is SourceState.FALLBACK and r.fallback_age is not None
+        }
         detail = override_detail or self._explain(state, result, age)
         return QueryResponse(
             key=result.key,
@@ -299,16 +308,19 @@ class TTLCache:
             in_flight_shared=in_flight_shared,
             age=age,
             detail=detail,
+            fallback_ages=fallback_ages,
         )
 
     @staticmethod
     def _explain(state: CacheState, result: AggregatedResult, age: float) -> str:
-        missing = [
-            f"{n}:{r.state.value}"
-            for n, r in result.sources.items()
-            if r.state is not None
-            and r.state.value != "ok"
-        ]
+        missing = []
+        for n, r in result.sources.items():
+            if r.state is SourceState.OK:
+                continue
+            if r.state is SourceState.FALLBACK and r.fallback_age is not None:
+                missing.append(f"{n}:fallback(age={r.fallback_age:.3f}s)")
+            else:
+                missing.append(f"{n}:{r.state.value}")
         missing_part = f" missing=[{', '.join(missing)}]" if missing else ""
         if state is CacheState.FRESH:
             return f"fresh cache hit, age={age:.3f}s.{missing_part}"

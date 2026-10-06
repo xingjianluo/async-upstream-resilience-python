@@ -7,7 +7,11 @@
 - 整次聚合受 aggregate_timeout 预算约束：预算耗尽时已完成来源保留，
   未完成来源标注 CANCELLED；
 - 来源抛错标注 ERROR。TIMEOUT/ERROR/CANCELLED 均为“降级缺失”而非整次失败；
-- 全部来源都不可用时，返回结果 any_ok=False，由上层决定返回旧值或明确拒绝。
+- 按来源短期回退：来源本次超时/失败/被取消时，若该来源在本键下的历史
+  成功值年龄 < fallback_ttl，则以 FALLBACK 状态顶上（保留真实失败原因与
+  回退值年龄），查询仍可成功但标注降级；超过有效期不兜底；
+- 全部来源都不可用（且无回退）时，返回结果 any_usable=False，
+  由上层决定返回旧值或明确拒绝。
 """
 from __future__ import annotations
 
@@ -17,6 +21,7 @@ import time
 from collections.abc import Awaitable, Callable
 
 from app.config import ResilienceConfig
+from app.fallback import SourceFallbackStore
 from app.metrics import Metrics
 from app.models import AggregatedResult, SourceResult, SourceState
 
@@ -33,12 +38,14 @@ class SourceAggregator:
         config: ResilienceConfig,
         source_timeouts: dict[str, float] | None = None,
         metrics: Metrics | None = None,
+        fallback_store: SourceFallbackStore | None = None,
     ) -> None:
         self._sources = dict(sources)
         self._config = config
         self._source_timeouts = dict(source_timeouts or {})
         self._sem = asyncio.Semaphore(config.fetch_concurrency)
         self._metrics = metrics
+        self._fallback = fallback_store or SourceFallbackStore(config.fallback_ttl)
 
     def _timeout_of(self, name: str) -> float:
         return self._source_timeouts.get(name, self._config.default_source_timeout)
@@ -104,20 +111,24 @@ class SourceAggregator:
         results: dict[str, SourceResult] = {}
         for name, task in tasks.items():
             result = self._resolve_task(name, key, task)
-            results[name] = result
             if self._metrics is not None:
+                # 先记真实结果（含失败），回退命中单独计数，两者不混。
                 self._metrics.record_source(result.state.value)
+            results[name] = self._apply_fallback(key, result)
 
         merged = {
-            name: r.value for name, r in results.items() if r.state is SourceState.OK
+            name: r.value
+            for name, r in results.items()
+            if r.state in (SourceState.OK, SourceState.FALLBACK)
         }
         degraded = any(r.state is not SourceState.OK for r in results.values())
         total = time.monotonic() - start
         logger.info(
-            "aggregate done: key=%s degraded=%s ok_sources=%s states=%s elapsed=%.3fs",
+            "aggregate done: key=%s degraded=%s ok_sources=%s fallback_sources=%s states=%s elapsed=%.3fs",
             key,
             degraded,
             [n for n, r in results.items() if r.state is SourceState.OK],
+            [n for n, r in results.items() if r.state is SourceState.FALLBACK],
             {n: r.state.value for n, r in results.items()},
             total,
         )
@@ -127,6 +138,31 @@ class SourceAggregator:
             merged=merged,
             degraded=degraded,
             total_elapsed=total,
+        )
+
+    def _apply_fallback(self, key: str, result: SourceResult) -> SourceResult:
+        """按来源短期回退：成功则登记基准值；失败则尝试用有效期内基准值顶上。"""
+        if result.state is SourceState.OK:
+            # 只按 (key, source) 写成功值：部分成功不会清掉其他来源的基准。
+            self._fallback.record(key, result.source, result.value)
+            return result
+        entry = self._fallback.lookup(key, result.source)
+        if entry is None:
+            return result
+        age = entry.age(time.monotonic())
+        if self._metrics is not None:
+            self._metrics.record_fallback(result.source)
+        logger.info(
+            "fallback applied: key=%s source=%s real_state=%s reason=%s fallback_age=%.3fs",
+            key, result.source, result.state.value, result.error, age,
+        )
+        return SourceResult(
+            source=result.source,
+            state=SourceState.FALLBACK,
+            value=entry.value,
+            error=result.error,  # 保留本次真实失败原因，对外可解释
+            elapsed=result.elapsed,
+            fallback_age=age,
         )
 
     def _resolve_task(

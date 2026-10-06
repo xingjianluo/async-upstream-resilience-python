@@ -20,10 +20,11 @@ class Priority(Enum):
 class SourceState(Enum):
     """单个来源在一次聚合中的最终状态。"""
 
-    OK = "ok"              # 成功返回并参与合并
+    OK = "ok"              # 成功返回并参与合并（本次实时值）
     TIMEOUT = "timeout"    # 超过单次来源超时
     ERROR = "error"        # 来源主动失败
     CANCELLED = "cancelled"  # 因整体超时/调用方取消而未完成
+    FALLBACK = "fallback"  # 本次超时/失败，用回退有效期内的历史可用值顶上
 
 
 class CacheState(Enum):
@@ -47,13 +48,18 @@ class RejectReason(Enum):
 
 @dataclass
 class SourceResult:
-    """单个来源的结果或失败标注。失败时 value=None。"""
+    """单个来源的结果或失败标注。失败时 value=None。
+
+    state=FALLBACK 时 value 为历史可用值，fallback_age 标注其年龄（秒），
+    error 保留本次真实失败原因，便于对外解释“这次其实没取到”。
+    """
 
     source: str
     state: SourceState
     value: object | None = None
     error: str | None = None
     elapsed: float = 0.0
+    fallback_age: float | None = None
 
 
 @dataclass
@@ -70,6 +76,14 @@ class AggregatedResult:
     @property
     def any_ok(self) -> bool:
         return any(s.state is SourceState.OK for s in self.sources.values())
+
+    @property
+    def any_usable(self) -> bool:
+        """是否存在可用数据（实时 OK 或回退 FALLBACK），决定本次查询能否成功。"""
+        return any(
+            s.state in (SourceState.OK, SourceState.FALLBACK)
+            for s in self.sources.values()
+        )
 
 
 @dataclass
@@ -91,7 +105,11 @@ class CacheEntry:
 
 @dataclass
 class QueryResponse:
-    """对外查询响应：数据 + 完整可解释性标注。"""
+    """对外查询响应：数据 + 完整可解释性标注。
+
+    fallback_ages：本次以回退值顶上的来源 -> 回退值年龄（秒）；
+    不在其中的来源即本次实时值或缺失，绝不把回退混成实时。
+    """
 
     key: str
     data: object | None
@@ -101,6 +119,7 @@ class QueryResponse:
     in_flight_shared: bool
     age: float
     detail: str
+    fallback_ages: dict[str, float] = field(default_factory=dict)
 
 
 class ResilienceError(Exception):

@@ -18,7 +18,8 @@ HTTP /query ──> ResilienceService.query(key, caller)
 | --- | --- |
 | `app/models.py` | 枚举与数据结构：来源状态、缓存状态、拒绝原因、对外响应 |
 | `app/config.py` | 全部关键配置项（见第 4 节） |
-| `app/aggregator.py` | 多来源并行、单来源超时、整体预算、部分失败降级 |
+| `app/aggregator.py` | 多来源并行、单来源超时、整体预算、部分失败降级、按来源回退替换 |
+| `app/fallback.py` | 按 (查询键, 来源) 的短期回退基准值存储（惰性过期） |
 | `app/cache.py` | 单飞回源合并、TTL、stale-while-revalidate、失败取舍 |
 | `app/quota.py` | 调用方并发配额、全局容量、HIGH/LOW 优先级队列 |
 | `app/service.py` | 串联三层的门面，统一取消清理 |
@@ -39,7 +40,30 @@ HTTP /query ──> ResilienceService.query(key, caller)
 - 全部来源都不可用时 `AggregatedResult.any_ok=false`，交由缓存层决定
   “返回旧值”还是“明确拒绝”。
 
-### 2.2 缓存新旧值取舍（TTLCache，时间基于 monotonic）
+### 2.2 按来源短期回退（SourceFallbackStore）
+
+适用场景：某个来源只是**偶发抖动**（短暂超时/报错），而它上一次返回的数据
+还很新。没有这一层时，本次查询会把该来源当缺失；开启后，该来源本次
+超时/失败/被取消时，用它在本查询键下**最近一次成功值**临时顶上。
+
+规则（时间基于 monotonic）：
+
+- 只在来源真实成功（`ok`）时按 `(key, source)` 登记基准值；失败永不写入，
+  一次部分成功也不会冲掉其他来源的基准；
+- 基准值年龄 `< fallback_ttl` 才可顶上：该来源状态标为 `fallback`，
+  响应的 `fallback_ages` 标注其年龄，`error` 字段保留本次真实失败原因；
+- 年龄 `≥ fallback_ttl` 基准值惰性驱逐，回到原有缺失/拒绝行为，
+  **绝不无限期拿历史值兜底**；`fallback_ttl=0` 可整体关闭回退；
+- 有回退值时查询仍可成功但 `degraded=true`（全部来源都靠回退时也成功）；
+  既无实时值又无回退时维持原有拒绝（`UpstreamUnavailableError` / HTTP 502）；
+- 回退判定发生在配额门之后的聚合层，**不绕过配额与容量限制**；
+  回退在单飞回源任务内完成，同键并发不会被放大成多次真实取数。
+
+对外可区分性：`source_states` 中 `ok`=本次实时值、`fallback`=回退值、
+`timeout`/`error`/`cancelled`=无回退可用的真实缺失；`fallback_ages` 只包含
+回退来源及其年龄，回退结果绝不会混成实时结果。
+
+### 2.3 缓存新旧值取舍（TTLCache，时间基于 monotonic）
 
 设条目年龄 `age = now - stored_at`：
 
@@ -60,7 +84,8 @@ HTTP /query ──> ResilienceService.query(key, caller)
 状态标注为 `in_flight`，与领导的 `miss` 可区分。
 
 **取消隔离**：领导/加入请求被调用方取消，不会取消真实回源任务——回源继续
-完成并落盘，后续请求可直接命中；在途表在回源 settle 时必定清理，不残留。
+完成并落盘，后续请求可直接命中；等待者之间通过 `asyncio.shield` 隔离，
+任一调用方取消不影响其他等待者；在途表在回源 settle 时必定清理，不残留。
 
 ## 3. 配额与优先级规则（PriorityGate）
 
@@ -91,6 +116,7 @@ HTTP /query ──> ResilienceService.query(key, caller)
 | `stale_ttl` | 5.0s | 旧值可接受宽限期 |
 | `allow_stale_on_error` | True | 回源失败时是否允许返回宽限内旧值 |
 | `refresh_min_interval` | 0.05s | 每键刷新节流，防 stale 期回源风暴 |
+| `fallback_ttl` | 2.0s | 按来源短期回退有效期；0 = 关闭回退 |
 | `QuotaPolicy.quotas` | 未登记=4 | 每调用方并发上限 |
 | `QuotaPolicy.priorities` | 未登记=LOW | 每调用方优先级 |
 
@@ -104,8 +130,14 @@ HTTP /query ──> ResilienceService.query(key, caller)
 - 回源：`fetch_started`、`fetch_shared`、`fetch_failures`、
   `fetch_by_key`（断言“同键仅一次回源”）
 - 来源：`source_ok` / `source_timeout` / `source_error` / `source_cancelled`
+- 回退：`fallback_hits`、`fallback_by_source`——与来源真实失败
+  （`source_*`）、最终拒绝（`fetch_failures`）分开计数，互不混淆
 - 配额门：`admitted`、`released`、`rejected_quota`、`rejected_capacity`
   及按调用方细分的拒绝计数
+
+响应兼容说明：`/query` 响应新增 `fallback_ages` 字段（回退来源 -> 年龄秒数），
+`source_states` 可能取到新值 `fallback`；既有字段语义不变，未开启回退
+（`fallback_ttl=0`）时响应与旧版本完全一致。
 
 单测与运行日志对每个判定打印**输入**（key/caller/来源/延迟）与**判定依据**
 （状态、年龄、缺失来源、拒绝原因）。
@@ -116,8 +148,9 @@ HTTP /query ──> ResilienceService.query(key, caller)
 
 ```bash
 uv sync                                  # 安装含 pytest 的依赖
-uv run pytest -q                         # 全部单测（23 个，告警即失败）
+uv run pytest -q                         # 全部单测（33 个，告警即失败）
 uv run pytest tests/test_cache.py -s -q  # 只跑缓存并发用例
+uv run pytest tests/test_fallback.py --log-cli-level=INFO -q  # 回退用例+判定日志
 ```
 
 启动演示服务（3 个模拟来源，flaky 可由环境变量制造故障）：
@@ -129,12 +162,19 @@ curl 'http://127.0.0.1:8000/metrics'
 FLAKY=timeout uv run uvicorn main:app --port 8000   # 演示来源超时降级
 ```
 
+本地复现按来源回退：先正常查询一次建立基准与缓存，再让 flaky 进入
+timeout/error 模式并等 `fresh_ttl` 过期，后续查询的 `source_states.flaky`
+会变为 `fallback` 且 `fallback_ages.flaky` 标注年龄，`/metrics` 中
+`fallback_hits` 随之增加；把 `fallback_ttl` 调小（如 0.5s）并等待超过该
+时长，即可观察到回退失效、回到缺失/拒绝行为。
+
 ### 测试覆盖场景
 
 | 文件 | 覆盖 |
 | --- | --- |
 | `tests/test_aggregator.py` | 部分失败、单来源超时、整体预算取消并清理、全失败 |
 | `tests/test_cache.py` | 10 并发单飞、fresh 命中、SWR 刷新、失败返旧值、过期拒绝、领导取消不杀回源 |
+| `tests/test_fallback.py` | 按来源回退、回退有效期边界、部分成功不冲基准、全失败有/无回退、并发不放大、取消隔离、配额/容量拒绝可区分 |
 | `tests/test_quota.py` | 配额 vs 容量拒绝可区分、HIGH 插队、等待取消无残留 |
 | `tests/test_service_integration.py` | 20 并发同键单回源、配额拒绝不泄漏、调用方取消清理、高优先级不被饿死 |
 | `tests/test_api.py` | 响应结构、402/422/502 状态码、健康与指标端点 |
